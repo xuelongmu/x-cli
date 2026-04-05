@@ -140,8 +140,28 @@ pub fn clap_command(app_spec: &AppSpec) -> Command {
         );
     }
 
+    // Native --json flag for structured output (not derived from legacy Ruby).
+    command = command.arg(
+        Arg::new("json")
+            .short('j')
+            .long("json")
+            .global(true)
+            .help("Output results as JSON")
+            .action(ArgAction::SetTrue),
+    );
+
     for subcommand in &app_spec.commands {
-        command = command.subcommand(build_subcommand(subcommand));
+        let mut sub = build_subcommand(subcommand);
+        // Add --thread flag to 'status' subcommand for thread expansion.
+        if subcommand.name == "status" {
+            sub = sub.arg(
+                Arg::new("thread")
+                    .long("thread")
+                    .help("Expand the full conversation thread")
+                    .action(ArgAction::SetTrue),
+            );
+        }
+        command = command.subcommand(sub);
     }
 
     command
