@@ -26,12 +26,13 @@ use x_api::oauth1::{self, ParamList, Token};
 const DEFAULT_NUM_RESULTS: usize = 20;
 const MAX_SEARCH_RESULTS: usize = 100;
 const MAX_PAGE: usize = 51;
-const V2_TWEET_FIELDS: &str = "author_id,created_at,entities,geo,id,in_reply_to_user_id,public_metrics,referenced_tweets,source,text";
+const V2_TWEET_FIELDS: &str = "author_id,created_at,entities,geo,id,in_reply_to_user_id,public_metrics,referenced_tweets,source,text,attachments,conversation_id";
 const V2_USER_FIELDS: &str =
     "created_at,description,id,location,name,protected,public_metrics,url,username,verified";
 const V2_LIST_FIELDS: &str =
     "created_at,description,follower_count,id,member_count,name,owner_id,private";
-const V2_TWEET_EXPANSIONS: &str = "author_id,geo.place_id";
+const V2_TWEET_EXPANSIONS: &str = "author_id,geo.place_id,referenced_tweets.id,attachments.media_keys";
+const V2_MEDIA_FIELDS: &str = "media_key,type,url,preview_image_url,height,width,duration_ms,alt_text";
 const V2_USER_EXPANSIONS: &str = "pinned_tweet_id";
 const V2_PLACE_FIELDS: &str =
     "contained_within,country,country_code,full_name,geo,id,name,place_type";
@@ -455,7 +456,11 @@ fn execute_remote_command(
                 AuthScheme::OAuth2User,
                 number,
             )?;
-            print_tweets(&tweets, leaf, out, &context.color);
+            if opt_bool(leaf, "json") {
+                write_json_array(out, &tweets);
+            } else {
+                print_tweets(&tweets, leaf, out, &context.color);
+            }
             Ok(0)
         }
         [single] if single == "open" => {
@@ -951,7 +956,11 @@ fn execute_remote_command(
                     number,
                 )?
             };
-            print_tweets(&tweets, leaf, out, &context.color);
+            if opt_bool(leaf, "json") {
+                write_json_array(out, &tweets);
+            } else {
+                print_tweets(&tweets, leaf, out, &context.color);
+            }
             Ok(0)
         }
         [single] if single == "status" => {
@@ -962,28 +971,91 @@ fn execute_remote_command(
                 .into_iter()
                 .next()
                 .unwrap_or(response);
-            print_status(&status, leaf, out);
-            let mut chain = Vec::new();
-            let mut current = status;
-            for _ in 0..10 {
-                let parent_id = match current.get("in_reply_to_status_id").and_then(Value::as_str) {
-                    Some(id) => id.to_string(),
-                    None => break,
-                };
-                let parent_response = backend
-                    .get_json_oauth2(&format!("/2/tweets/{}", parent_id), v2_tweet_params())?;
-                match extract_tweets(&parent_response).into_iter().next() {
-                    Some(p) => {
-                        current = p.clone();
-                        chain.push(p);
-                    }
-                    None => break,
+
+            let is_json = opt_bool(leaf, "json");
+            let is_thread = opt_bool(leaf, "thread");
+
+            if is_thread {
+                // Thread expansion: use conversation_id to fetch the full thread
+                let mut thread_tweets = vec![status.clone()];
+                if let Some(conversation_id) = status.get("conversation_id").and_then(Value::as_str)
+                {
+                    let thread_response = backend.get_json_oauth2(
+                        "/2/tweets/search/recent",
+                        [
+                            vec![
+                                (
+                                    "query".to_string(),
+                                    format!("conversation_id:{conversation_id}"),
+                                ),
+                                ("max_results".to_string(), "100".to_string()),
+                            ],
+                            v2_tweet_params(),
+                        ]
+                        .concat(),
+                    )?;
+                    let mut conversation_tweets = extract_tweets(&thread_response);
+                    // Remove the original tweet if it appears in the thread results
+                    let status_id = value_id(&status).unwrap_or_default();
+                    conversation_tweets.retain(|t| value_id(t).unwrap_or_default() != status_id);
+                    thread_tweets.extend(conversation_tweets);
                 }
-            }
-            if !chain.is_empty() {
-                writeln!(out).ok();
-                writeln!(out, "In reply to:").ok();
-                print_tweets(&chain, leaf, out, &context.color);
+                // Sort by ID (chronological)
+                thread_tweets.sort_by(|a, b| {
+                    let a_id = value_id(a)
+                        .unwrap_or_default()
+                        .parse::<u64>()
+                        .unwrap_or(0);
+                    let b_id = value_id(b)
+                        .unwrap_or_default()
+                        .parse::<u64>()
+                        .unwrap_or(0);
+                    a_id.cmp(&b_id)
+                });
+
+                if is_json {
+                    write_json_array(out, &thread_tweets);
+                } else {
+                    print_tweets(&thread_tweets, leaf, out, &context.color);
+                }
+            } else {
+                // Standard status display with reply chain
+                let mut chain = Vec::new();
+                let mut current = status.clone();
+                for _ in 0..10 {
+                    let parent_id =
+                        match current.get("in_reply_to_status_id").and_then(Value::as_str) {
+                            Some(id) => id.to_string(),
+                            None => break,
+                        };
+                    let parent_response = backend.get_json_oauth2(
+                        &format!("/2/tweets/{}", parent_id),
+                        v2_tweet_params(),
+                    )?;
+                    match extract_tweets(&parent_response).into_iter().next() {
+                        Some(p) => {
+                            current = p.clone();
+                            chain.push(p);
+                        }
+                        None => break,
+                    }
+                }
+
+                if is_json {
+                    let mut result = serde_json::Map::new();
+                    result.insert("status".to_string(), status);
+                    if !chain.is_empty() {
+                        result.insert("in_reply_to_chain".to_string(), Value::Array(chain));
+                    }
+                    write_json(out, &Value::Object(result));
+                } else {
+                    print_status(&status, leaf, out);
+                    if !chain.is_empty() {
+                        writeln!(out).ok();
+                        writeln!(out, "In reply to:").ok();
+                        print_tweets(&chain, leaf, out, &context.color);
+                    }
+                }
             }
             Ok(0)
         }
@@ -1740,7 +1812,11 @@ fn execute_remote_command(
                 AuthScheme::OAuth2Bearer,
                 number,
             )?;
-            print_tweets(&tweets, leaf, out, &context.color);
+            if opt_bool(leaf, "json") {
+                write_json_array(out, &tweets);
+            } else {
+                print_tweets(&tweets, leaf, out, &context.color);
+            }
             Ok(0)
         }
         [first, second] if first == "search" && second == "timeline" => {
@@ -1773,7 +1849,11 @@ fn execute_remote_command(
                 )?
             };
             let tweets = filter_tweets_by_query(&tweets, &query);
-            print_tweets(&tweets, leaf, out, &context.color);
+            if opt_bool(leaf, "json") {
+                write_json_array(out, &tweets);
+            } else {
+                print_tweets(&tweets, leaf, out, &context.color);
+            }
             Ok(0)
         }
         [first, second] if first == "search" && second == "mentions" => {
@@ -1788,7 +1868,11 @@ fn execute_remote_command(
                 MAX_SEARCH_RESULTS * MAX_PAGE,
             )?;
             let tweets = filter_tweets_by_query(&tweets, &args.join(" "));
-            print_tweets(&tweets, leaf, out, &context.color);
+            if opt_bool(leaf, "json") {
+                write_json_array(out, &tweets);
+            } else {
+                print_tweets(&tweets, leaf, out, &context.color);
+            }
             Ok(0)
         }
         [first, second] if first == "search" && second == "favorites" => {
@@ -1808,7 +1892,11 @@ fn execute_remote_command(
                 MAX_SEARCH_RESULTS * MAX_PAGE,
             )?;
             let tweets = filter_tweets_by_query(&tweets, &query);
-            print_tweets(&tweets, leaf, out, &context.color);
+            if opt_bool(leaf, "json") {
+                write_json_array(out, &tweets);
+            } else {
+                print_tweets(&tweets, leaf, out, &context.color);
+            }
             Ok(0)
         }
         [first, second] if first == "search" && second == "retweets" => {
@@ -1836,7 +1924,11 @@ fn execute_remote_command(
                 tweets.retain(|tweet| tweet_text(tweet, false).starts_with("RT @"));
             }
             let tweets = filter_tweets_by_query(&tweets, &query);
-            print_tweets(&tweets, leaf, out, &context.color);
+            if opt_bool(leaf, "json") {
+                write_json_array(out, &tweets);
+            } else {
+                print_tweets(&tweets, leaf, out, &context.color);
+            }
             Ok(0)
         }
         [first, second] if first == "search" && second == "list" => {
@@ -1852,13 +1944,21 @@ fn execute_remote_command(
                 MAX_SEARCH_RESULTS * MAX_PAGE,
             )?;
             let tweets = filter_tweets_by_query(&tweets, &query);
-            print_tweets(&tweets, leaf, out, &context.color);
+            if opt_bool(leaf, "json") {
+                write_json_array(out, &tweets);
+            } else {
+                print_tweets(&tweets, leaf, out, &context.color);
+            }
             Ok(0)
         }
         [first, second] if first == "search" && second == "users" => {
             ensure_min_args(path, args, 1)?;
             let users = collect_user_search_pages(backend, &args.join(" "))?;
-            print_users(&users, leaf, out);
+            if opt_bool(leaf, "json") {
+                write_json_array(out, &users);
+            } else {
+                print_users(&users, leaf, out);
+            }
             Ok(0)
         }
         [first, second] if first == "set" && second == "bio" => {
@@ -4671,6 +4771,7 @@ fn v2_tweet_params() -> Vec<(String, String)> {
         ("expansions".to_string(), V2_TWEET_EXPANSIONS.to_string()),
         ("user.fields".to_string(), V2_USER_FIELDS.to_string()),
         ("place.fields".to_string(), V2_PLACE_FIELDS.to_string()),
+        ("media.fields".to_string(), V2_MEDIA_FIELDS.to_string()),
     ]
 }
 
@@ -4934,6 +5035,8 @@ fn normalize_v2_tweet(
     tweet: &Value,
     users_by_id: &HashMap<String, Value>,
     places_by_id: &HashMap<String, Value>,
+    tweets_by_id: &HashMap<String, Value>,
+    media_by_key: &HashMap<String, Value>,
 ) -> Value {
     if tweet.get("user").is_some() {
         return tweet.clone();
@@ -4964,19 +5067,82 @@ fn normalize_v2_tweet(
     if let Some(source) = tweet.get("source") {
         object.insert("source".to_string(), source.clone());
     }
-    if let Some(refs) = tweet.get("referenced_tweets").and_then(Value::as_array)
-        && let Some(replied) = refs
+    if let Some(conversation_id) = tweet.get("conversation_id").and_then(Value::as_str) {
+        object.insert(
+            "conversation_id".to_string(),
+            Value::String(conversation_id.to_string()),
+        );
+    }
+    if let Some(refs) = tweet.get("referenced_tweets").and_then(Value::as_array) {
+        if let Some(replied) = refs
             .iter()
             .find(|r| r.get("type").and_then(Value::as_str) == Some("replied_to"))
-        && let Some(id) = replied.get("id").and_then(Value::as_str)
-    {
-        object.insert(
-            "in_reply_to_status_id".to_string(),
-            Value::String(id.to_string()),
-        );
+            && let Some(id) = replied.get("id").and_then(Value::as_str)
+        {
+            object.insert(
+                "in_reply_to_status_id".to_string(),
+                Value::String(id.to_string()),
+            );
+        }
+
+        // Quoted tweet expansion
+        if let Some(quoted_ref) = refs
+            .iter()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("quoted"))
+            && let Some(quoted_id) = quoted_ref.get("id").and_then(Value::as_str)
+        {
+            object.insert(
+                "quoted_status_id".to_string(),
+                Value::String(quoted_id.to_string()),
+            );
+            if let Some(quoted_tweet) = tweets_by_id.get(quoted_id) {
+                let empty_tweets = HashMap::new();
+                let empty_media = HashMap::new();
+                let normalized =
+                    normalize_v2_tweet(quoted_tweet, users_by_id, places_by_id, &empty_tweets, &empty_media);
+                object.insert("quoted_status".to_string(), normalized);
+            }
+        }
     }
     if let Some(entities) = tweet.get("entities") {
         object.insert("entities".to_string(), entities.clone());
+
+        // Article extraction: look for x.com/i/article/ links in entities.urls
+        if let Some(urls) = entities.get("urls").and_then(Value::as_array) {
+            let articles: Vec<Value> = urls
+                .iter()
+                .filter_map(|url_entity| {
+                    let expanded = url_entity
+                        .get("expanded_url")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if expanded.contains("/i/article/") {
+                        let mut article = serde_json::Map::new();
+                        article.insert("url".to_string(), Value::String(expanded.to_string()));
+                        if let Some(title) = url_entity.get("title").and_then(Value::as_str) {
+                            article.insert("title".to_string(), Value::String(title.to_string()));
+                        }
+                        if let Some(desc) = url_entity.get("description").and_then(Value::as_str) {
+                            article
+                                .insert("description".to_string(), Value::String(desc.to_string()));
+                        }
+                        if let Some(unwound) = url_entity.get("unwound_url").and_then(Value::as_str)
+                        {
+                            article.insert(
+                                "unwound_url".to_string(),
+                                Value::String(unwound.to_string()),
+                            );
+                        }
+                        Some(Value::Object(article))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !articles.is_empty() {
+                object.insert("articles".to_string(), Value::Array(articles));
+            }
+        }
     }
     if let Some(metrics) = tweet.get("public_metrics") {
         if let Some(retweets) = metrics.get("retweet_count") {
@@ -4984,6 +5150,12 @@ fn normalize_v2_tweet(
         }
         if let Some(favorites) = metrics.get("like_count") {
             object.insert("favorite_count".to_string(), favorites.clone());
+        }
+        if let Some(replies) = metrics.get("reply_count") {
+            object.insert("reply_count".to_string(), replies.clone());
+        }
+        if let Some(quotes) = metrics.get("quote_count") {
+            object.insert("quote_count".to_string(), quotes.clone());
         }
     }
 
@@ -5009,6 +5181,24 @@ fn normalize_v2_tweet(
         && let Some(place) = places_by_id.get(place_id)
     {
         object.insert("place".to_string(), place.clone());
+    }
+
+    // Media expansion from attachments.media_keys
+    if let Some(media_keys) = tweet
+        .get("attachments")
+        .and_then(|a| a.get("media_keys"))
+        .and_then(Value::as_array)
+    {
+        let media_items: Vec<Value> = media_keys
+            .iter()
+            .filter_map(|key| {
+                let key_str = key.as_str()?;
+                media_by_key.get(key_str).cloned()
+            })
+            .collect();
+        if !media_items.is_empty() {
+            object.insert("media".to_string(), Value::Array(media_items));
+        }
     }
 
     Value::Object(object)
@@ -5147,33 +5337,68 @@ fn extract_tweets(value: &Value) -> Vec<Value> {
         return statuses.clone();
     }
 
+    let includes = value.get("includes");
     let users_by_id = index_items_by_id(
-        value
-            .get("includes")
-            .and_then(|includes| includes.get("users"))
+        includes
+            .and_then(|inc| inc.get("users"))
             .and_then(Value::as_array)
             .map(Vec::as_slice),
     );
     let places_by_id = index_items_by_id(
-        value
-            .get("includes")
-            .and_then(|includes| includes.get("places"))
+        includes
+            .and_then(|inc| inc.get("places"))
             .and_then(Value::as_array)
             .map(Vec::as_slice),
+    );
+    let tweets_by_id = index_items_by_id(
+        includes
+            .and_then(|inc| inc.get("tweets"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice),
+    );
+    let media_by_key = index_items_by_field(
+        includes
+            .and_then(|inc| inc.get("media"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice),
+        "media_key",
     );
     if let Some(data) = value.get("data").and_then(Value::as_array) {
         return data
             .iter()
-            .map(|tweet| normalize_v2_tweet(tweet, &users_by_id, &places_by_id))
+            .map(|tweet| {
+                normalize_v2_tweet(tweet, &users_by_id, &places_by_id, &tweets_by_id, &media_by_key)
+            })
             .collect();
     }
     if let Some(data) = value.get("data")
         && data.is_object()
     {
-        return vec![normalize_v2_tweet(data, &users_by_id, &places_by_id)];
+        return vec![normalize_v2_tweet(
+            data,
+            &users_by_id,
+            &places_by_id,
+            &tweets_by_id,
+            &media_by_key,
+        )];
     }
 
     Vec::new()
+}
+
+fn index_items_by_field(
+    items: Option<&[Value]>,
+    field: &str,
+) -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+    if let Some(items) = items {
+        for item in items {
+            if let Some(key) = item.get(field).and_then(Value::as_str) {
+                map.insert(key.to_string(), item.clone());
+            }
+        }
+    }
+    map
 }
 
 fn extract_users(value: &Value) -> Vec<Value> {
@@ -5196,6 +5421,8 @@ fn extract_users(value: &Value) -> Vec<Value> {
     if let Some(users) = users.and_then(Value::as_array) {
         let empty_users = HashMap::new();
         let empty_places = HashMap::new();
+        let empty_tweets = HashMap::new();
+        let empty_media = HashMap::new();
         return users
             .iter()
             .map(|user| {
@@ -5206,7 +5433,7 @@ fn extract_users(value: &Value) -> Vec<Value> {
                 {
                     obj.insert(
                         "status".to_string(),
-                        normalize_v2_tweet(tweet, &empty_users, &empty_places),
+                        normalize_v2_tweet(tweet, &empty_users, &empty_places, &empty_tweets, &empty_media),
                     );
                 }
                 normalized
@@ -5221,9 +5448,11 @@ fn extract_users(value: &Value) -> Vec<Value> {
         {
             let empty_users = HashMap::new();
             let empty_places = HashMap::new();
+            let empty_tweets = HashMap::new();
+            let empty_media = HashMap::new();
             obj.insert(
                 "status".to_string(),
-                normalize_v2_tweet(tweet, &empty_users, &empty_places),
+                normalize_v2_tweet(tweet, &empty_users, &empty_places, &empty_tweets, &empty_media),
             );
         }
         return vec![normalized];
@@ -5814,6 +6043,14 @@ fn opt_bool(matches: &ArgMatches, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn write_json(out: &mut dyn Write, value: &Value) {
+    writeln!(out, "{}", serde_json::to_string_pretty(value).unwrap_or_default()).ok();
+}
+
+fn write_json_array(out: &mut dyn Write, values: &[Value]) {
+    write_json(out, &Value::Array(values.to_vec()));
+}
+
 fn opt_string<'a>(matches: &'a ArgMatches, key: &str) -> Option<&'a str> {
     matches
         .try_get_one::<String>(key)
@@ -6041,6 +6278,30 @@ mod tests {
         }
 
         fn get_json_oauth2(
+            &mut self,
+            _path: &str,
+            _params: Vec<(String, String)>,
+        ) -> Result<Value, BackendError> {
+            Err(self.fail())
+        }
+
+        fn get_json_oauth2_user(
+            &mut self,
+            _path: &str,
+            _params: Vec<(String, String)>,
+        ) -> Result<Value, BackendError> {
+            Err(self.fail())
+        }
+
+        fn post_json_body_oauth2_user(
+            &mut self,
+            _path: &str,
+            _body: Value,
+        ) -> Result<Value, BackendError> {
+            Err(self.fail())
+        }
+
+        fn delete_json_oauth2_user(
             &mut self,
             _path: &str,
             _params: Vec<(String, String)>,
@@ -7323,5 +7584,361 @@ mod tests {
 
     fn profile_path() -> String {
         format!("{}/legacy/test/fixtures/.trc", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    #[test]
+    fn timeline_json_outputs_array() {
+        let mut backend = MockBackend::new();
+        backend.enqueue_json_response(
+            "GET",
+            "/2/users/me",
+            json!({
+                "data": {
+                    "id": "99",
+                    "username": "testcli"
+                }
+            }),
+        );
+        backend.enqueue_json_response(
+            "GET",
+            "/2/users/99/timelines/reverse_chronological",
+            json!({
+                "data": [{
+                    "id": "1",
+                    "created_at": "2011-04-06T19:13:37.000Z",
+                    "text": "hello world",
+                    "author_id": "42"
+                }],
+                "includes": {
+                    "users": [{
+                        "id": "42",
+                        "username": "alice"
+                    }]
+                }
+            }),
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with_backend(
+            ["x", "--json", "timeline"],
+            &mut stdout,
+            &mut stderr,
+            &mut backend,
+        );
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8(stdout).expect("utf8");
+        let parsed: Value = serde_json::from_str(&output).expect("valid JSON array");
+        assert!(parsed.is_array());
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["text"], "hello world");
+        assert_eq!(parsed[0]["user"]["screen_name"], "alice");
+    }
+
+    #[test]
+    fn status_json_includes_quoted_tweet() {
+        let mut backend = MockBackend::new();
+        backend.enqueue_json_response(
+            "GET",
+            "/2/tweets/100",
+            json!({
+                "data": {
+                    "id": "100",
+                    "text": "Check this out",
+                    "author_id": "1",
+                    "created_at": "2024-01-01T00:00:00.000Z",
+                    "referenced_tweets": [
+                        {"type": "quoted", "id": "50"}
+                    ]
+                },
+                "includes": {
+                    "users": [{"id": "1", "username": "quoter"}],
+                    "tweets": [{
+                        "id": "50",
+                        "text": "Original thought",
+                        "author_id": "2",
+                        "created_at": "2024-01-01T00:00:00.000Z"
+                    }]
+                }
+            }),
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with_backend(
+            ["x", "--json", "status", "100"],
+            &mut stdout,
+            &mut stderr,
+            &mut backend,
+        );
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8(stdout).expect("utf8");
+        let parsed: Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(parsed["status"]["quoted_status_id"], "50");
+        assert_eq!(parsed["status"]["quoted_status"]["text"], "Original thought");
+    }
+
+    #[test]
+    fn status_json_includes_media() {
+        let mut backend = MockBackend::new();
+        backend.enqueue_json_response(
+            "GET",
+            "/2/tweets/200",
+            json!({
+                "data": {
+                    "id": "200",
+                    "text": "Photo post",
+                    "author_id": "1",
+                    "created_at": "2024-01-01T00:00:00.000Z",
+                    "attachments": {
+                        "media_keys": ["media_1"]
+                    }
+                },
+                "includes": {
+                    "users": [{"id": "1", "username": "poster"}],
+                    "media": [{
+                        "media_key": "media_1",
+                        "type": "photo",
+                        "url": "https://pbs.twimg.com/media/example.jpg",
+                        "width": 1024,
+                        "height": 768
+                    }]
+                }
+            }),
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with_backend(
+            ["x", "--json", "status", "200"],
+            &mut stdout,
+            &mut stderr,
+            &mut backend,
+        );
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8(stdout).expect("utf8");
+        let parsed: Value = serde_json::from_str(&output).expect("valid JSON");
+        let media = parsed["status"]["media"].as_array().expect("media array");
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0]["type"], "photo");
+        assert_eq!(media[0]["url"], "https://pbs.twimg.com/media/example.jpg");
+    }
+
+    #[test]
+    fn search_all_json_outputs_array() {
+        let mut backend = MockBackend::new();
+        backend.enqueue_json_response(
+            "GET",
+            "/2/tweets/search/recent",
+            json!({
+                "data": [
+                    {
+                        "id": "10",
+                        "text": "found it",
+                        "author_id": "5",
+                        "created_at": "2024-01-01T00:00:00.000Z"
+                    }
+                ],
+                "includes": {
+                    "users": [{"id": "5", "username": "searcher"}]
+                },
+                "meta": {"result_count": 1}
+            }),
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with_backend(
+            ["x", "--json", "search", "all", "hello"],
+            &mut stdout,
+            &mut stderr,
+            &mut backend,
+        );
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8(stdout).expect("utf8");
+        let parsed: Value = serde_json::from_str(&output).expect("valid JSON array");
+        assert!(parsed.is_array());
+        assert_eq!(parsed[0]["text"], "found it");
+    }
+
+    #[test]
+    fn bookmarks_json_outputs_array() {
+        let mut backend = MockBackend::new();
+        // authenticated_user_id_for_bookmarks calls /2/users/me via OAuth2User
+        backend.enqueue_json_response(
+            "GET",
+            "/2/users/me",
+            json!({
+                "data": {
+                    "id": "77",
+                    "username": "tester"
+                }
+            }),
+        );
+        backend.enqueue_json_response(
+            "GET",
+            "/2/users/77/bookmarks",
+            json!({
+                "data": [{
+                    "id": "300",
+                    "created_at": "2024-06-01T12:00:00.000Z",
+                    "text": "bookmarked post",
+                    "author_id": "8"
+                }],
+                "includes": {
+                    "users": [{"id": "8", "username": "author"}]
+                }
+            }),
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with_backend(
+            ["x", "--json", "bookmarks"],
+            &mut stdout,
+            &mut stderr,
+            &mut backend,
+        );
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8(stdout).expect("utf8");
+        let parsed: Value = serde_json::from_str(&output).expect("valid JSON array");
+        assert!(parsed.is_array());
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["text"], "bookmarked post");
+        assert_eq!(parsed[0]["user"]["screen_name"], "author");
+    }
+
+    #[test]
+    fn status_thread_json_outputs_sorted_array() {
+        let mut backend = MockBackend::new();
+        // Initial status fetch
+        backend.enqueue_json_response(
+            "GET",
+            "/2/tweets/500",
+            json!({
+                "data": {
+                    "id": "500",
+                    "text": "thread starter",
+                    "author_id": "1",
+                    "created_at": "2024-01-01T00:00:00.000Z",
+                    "conversation_id": "500"
+                },
+                "includes": {
+                    "users": [{"id": "1", "username": "threadauthor"}]
+                }
+            }),
+        );
+        // Thread search by conversation_id
+        backend.enqueue_json_response(
+            "GET",
+            "/2/tweets/search/recent",
+            json!({
+                "data": [
+                    {
+                        "id": "501",
+                        "text": "reply one",
+                        "author_id": "1",
+                        "created_at": "2024-01-01T00:01:00.000Z",
+                        "conversation_id": "500"
+                    },
+                    {
+                        "id": "502",
+                        "text": "reply two",
+                        "author_id": "2",
+                        "created_at": "2024-01-01T00:02:00.000Z",
+                        "conversation_id": "500"
+                    }
+                ],
+                "includes": {
+                    "users": [
+                        {"id": "1", "username": "threadauthor"},
+                        {"id": "2", "username": "replier"}
+                    ]
+                }
+            }),
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with_backend(
+            ["x", "--json", "status", "--thread", "500"],
+            &mut stdout,
+            &mut stderr,
+            &mut backend,
+        );
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8(stdout).expect("utf8");
+        let parsed: Value = serde_json::from_str(&output).expect("valid JSON array");
+        let arr = parsed.as_array().expect("should be array");
+        assert_eq!(arr.len(), 3);
+        // Should be sorted chronologically by ID
+        assert_eq!(arr[0]["id_str"], "500");
+        assert_eq!(arr[1]["id_str"], "501");
+        assert_eq!(arr[2]["id_str"], "502");
+        assert_eq!(arr[0]["text"], "thread starter");
+        assert_eq!(arr[2]["text"], "reply two");
+    }
+
+    #[test]
+    fn status_json_includes_articles() {
+        let mut backend = MockBackend::new();
+        backend.enqueue_json_response(
+            "GET",
+            "/2/tweets/300",
+            json!({
+                "data": {
+                    "id": "300",
+                    "text": "Read my article",
+                    "author_id": "1",
+                    "created_at": "2024-01-01T00:00:00.000Z",
+                    "entities": {
+                        "urls": [
+                            {
+                                "expanded_url": "https://x.com/i/article/123456",
+                                "title": "My Great Article",
+                                "description": "A deep dive"
+                            },
+                            {
+                                "expanded_url": "https://example.com/not-an-article"
+                            }
+                        ]
+                    }
+                },
+                "includes": {
+                    "users": [{"id": "1", "username": "writer"}]
+                }
+            }),
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with_backend(
+            ["x", "--json", "status", "300"],
+            &mut stdout,
+            &mut stderr,
+            &mut backend,
+        );
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8(stdout).expect("utf8");
+        let parsed: Value = serde_json::from_str(&output).expect("valid JSON");
+        let articles = parsed["status"]["articles"].as_array().expect("articles array");
+        assert_eq!(articles.len(), 1);
+        assert_eq!(articles[0]["url"], "https://x.com/i/article/123456");
+        assert_eq!(articles[0]["title"], "My Great Article");
+        assert_eq!(articles[0]["description"], "A deep dive");
     }
 }
